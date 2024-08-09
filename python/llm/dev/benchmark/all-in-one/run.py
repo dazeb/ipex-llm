@@ -29,7 +29,7 @@ from datetime import date
 import os
 current_dir = os.path.dirname(os.path.realpath(__file__))
 import sys
-from ipex_llm.utils.benchmark_util import BenchmarkWrapper
+from ipex_llm.utils import BenchmarkWrapper
 from ipex_llm.utils.common.log4Error import invalidInputError
 from ipex_llm.utils.common import invalidInputError
 
@@ -42,6 +42,10 @@ CHATGLM_IDS = ['THUDM/chatglm-6b', 'THUDM/chatglm2-6b', 'THUDM/chatglm3-6b']
 
 LLAVA_IDS = ['liuhaotian/llava-v1.5-7b']
 
+PHI3VISION_IDS = ['microsoft/phi-3-vision-128k-instruct']
+
+QWENVL_IDS = ['Qwen/Qwen-VL-Chat']
+
 results = []
 excludes = []
 
@@ -49,8 +53,8 @@ def run_model_in_thread(model, in_out, tokenizer, result, warm_up, num_beams, in
     for i in range(num_trials + warm_up):
         st = time.perf_counter()
         if lookahead:
-            output_ids = model.generate(input_ids, lookahead=3, do_sample=False, max_matching_ngram_size=2, max_new_tokens=out_len,
-                                    min_new_tokens=out_len, num_beams=num_beams)
+            output_ids = model.generate(input_ids, lookahead=2, do_sample=False, max_matching_ngram_size=2, max_new_tokens=out_len,
+                                        min_new_tokens=out_len, num_beams=num_beams)
         else:
             output_ids = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
                                         min_new_tokens=out_len, num_beams=num_beams)
@@ -63,12 +67,25 @@ def run_model_in_thread(model, in_out, tokenizer, result, warm_up, num_beams, in
         torch.xpu.empty_cache()
         actual_out_len = output_ids.shape[1] - actual_in_len
         if i >= warm_up:
-            if lookahead:
-                result[in_out].append([model.first_token_time, (end - st - model.first_token_time)/model.n_token_generated, 0,
+            if lookahead or os.environ.get("IPEX_LLM_PERFORMANCE_MODE", None) == "1":
+                result[in_out].append([model.first_token_time, (end - st - model.first_token_time)/(model.n_token_generated - 1), 0,
                                        actual_in_len, actual_out_len, load_time, 0])
             else:
                 result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
                                         actual_in_len, actual_out_len, load_time, model.peak_memory])
+
+
+def get_continuation_input_str(in_len):
+    # in_len.txt maybe shorter than we need,
+    # use much longer context to make sure input length
+    test_length = min(in_len*2, 8192)
+    while test_length not in [32, 256, 1024, 2048, 8192] and test_length < 8192:
+        test_length = test_length * 2
+    # Force the test_length to be 8192, such that we can use 8192.txt
+    if test_length > 8192:
+        test_length = 8192
+    return open(f"prompt/continuation/{test_length}.txt", 'r').read()
+
 
 def preprocess_prompt(tokenizer, in_len, task):
     if task == 'summarize':
@@ -157,6 +174,8 @@ def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, 
         result = run_speculative_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
     elif test_api == 'pipeline_parallel_gpu':
         result = run_pipeline_parallel_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size, cpu_embedding, fp16=use_fp16_torch_dtype)
+    elif test_api == 'transformers_int4_npu_win':
+        result = transformers_int4_npu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     else:
         invalidInputError(False, "Unknown test_api " + test_api + ", please check your config.yaml.")
 
@@ -212,7 +231,7 @@ def run_native_int4(repo_id,
         in_out_len = in_out.split("-")
         in_len = int(in_out_len[0])
         out_len = int(in_out_len[1])
-        input_str = open(f"prompt/continuation/{in_len}.txt", 'r').read()
+        input_str = get_continuation_input_str(in_len)
         # As different tokenizer has different encodings,
         # slice the input_ids to ensure the prompt length is required length.
         n_ctx = in_len + out_len if in_len + out_len > 512 else 512
@@ -268,13 +287,7 @@ def run_transformer_int4(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -333,13 +346,7 @@ def run_pytorch_autocast_bf16(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -404,13 +411,7 @@ def run_optimize_model(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -474,6 +475,13 @@ def run_transformer_int4_gpu(repo_id,
                                                      use_cache=True, cpu_embedding=cpu_embedding,
                                                      torch_dtype=torch_dtype).eval()
         tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    elif origin_repo_id in PHI3VISION_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                     _attn_implementation="eager",
+                                                     modules_to_not_convert=["vision_embed_tokens"],
+                                                     trust_remote_code=True, use_cache=True, 
+                                                     cpu_embedding=cpu_embedding, torch_dtype=torch_dtype).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     else:
         if "4bit" in repo_id:
             model = AutoModelForCausalLM.load_low_bit(model_path, optimize_model=True,
@@ -502,7 +510,7 @@ def run_transformer_int4_gpu(repo_id,
     load_time = end - st
     print(">> loading of model costs {}s and {}GB".format(load_time, torch.xpu.memory.memory_reserved()/(1024**3)))
 
-    if not lookahead:
+    if not lookahead and os.environ.get("IPEX_LLM_PERFORMANCE_MODE", None) != "1":
         model = BenchmarkWrapper(model)
 
     result = {}
@@ -512,15 +520,7 @@ def run_transformer_int4_gpu(repo_id,
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
             if task == 'continuation':
-                # As different tokenizer has different encodings,
-                # in_len.txt maybe shorter than we need,
-                # use much longer context to make sure input length
-                test_length = min(in_len*2, 8192)
-                while test_length not in [32, 256, 1024, 2048, 8192] and test_length < 8192:
-                    test_length = test_length * 2
-                # For the sequence length not in [32, 256, 1024, 2048, 8192], it will be truncated from 8192.txt.
-                test_length = min(test_length, 8192)
-                input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+                input_str = get_continuation_input_str(in_len)
                 # As different tokenizer has different encodings,
                 # slice the input_ids to ensure the prompt length is required length.
                 input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -562,6 +562,72 @@ def run_transformer_int4_gpu(repo_id,
     del model
     gc.collect()
     return result
+
+
+def transformers_int4_npu_win(repo_id,
+                                 local_model_hub,
+                                 in_out_pairs,
+                                 warm_up,
+                                 num_trials,
+                                 num_beams,
+                                 low_bit,
+                                 batch_size):
+    from ipex_llm.transformers.npu_model import AutoModel, AutoModelForCausalLM
+    from transformers import AutoTokenizer, LlamaTokenizer
+
+    model_path = get_model_path(repo_id, local_model_hub)
+    # Load model in 4 bit,
+    # which convert the relevant layers in the model into INT4 format
+    st = time.perf_counter()
+    if repo_id in CHATGLM_IDS:
+        model = AutoModel.from_pretrained(model_path, load_in_low_bit=low_bit, trust_remote_code=True, torch_dtype='auto').eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    elif repo_id in LLAMA_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit=low_bit, trust_remote_code=True,
+                                                     use_cache=True).eval()
+        tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit=low_bit, trust_remote_code=True,
+                                                     use_cache=True).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    end = time.perf_counter()
+    load_time = end - st
+    print(">> loading of model costs {}s".format(load_time))
+
+    model = BenchmarkWrapper(model)
+
+    result = {}
+    with torch.inference_mode():
+        for in_out in in_out_pairs:
+            in_out_len = in_out.split("-")
+            in_len = int(in_out_len[0])
+            out_len = int(in_out_len[1])
+            input_str = get_continuation_input_str(in_len)
+            # As different tokenizer has different encodings,
+            # slice the input_ids to ensure the prompt length is required length.
+            input_ids = tokenizer.encode(input_str, return_tensors="pt")
+            input_ids = input_ids[:, :in_len]
+            true_str = tokenizer.batch_decode(input_ids)[0]
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
+            actual_in_len = input_ids.shape[1]
+            result[in_out] = []
+            for i in range(num_trials + warm_up):
+                st = time.perf_counter()
+                output_ids = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                            min_new_tokens=out_len, num_beams=num_beams)
+                end = time.perf_counter()
+                print("model generate cost: " + str(end - st))
+                output = tokenizer.batch_decode(output_ids)
+                print(output[0])
+                actual_out_len = output_ids.shape[1] - actual_in_len
+                if i >= warm_up:
+                    result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
+                                           actual_in_len, actual_out_len, load_time])
+    del model
+    gc.collect()
+    return result
+
 
 def run_optimize_model_gpu(repo_id,
                            local_model_hub,
@@ -607,13 +673,7 @@ def run_optimize_model_gpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -678,13 +738,7 @@ def run_ipex_fp16_gpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -755,13 +809,7 @@ def run_bigdl_fp16_gpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -847,13 +895,7 @@ def run_deepspeed_transformer_int4_cpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -914,6 +956,19 @@ def run_transformer_int4_gpu_win(repo_id,
                                           trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = model.to('xpu')
+    elif repo_id in PHI3VISION_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                     _attn_implementation="eager",
+                                                     modules_to_not_convert=["vision_embed_tokens"],
+                                                     trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.to('xpu')
+    elif repo_id in QWENVL_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                     modules_to_not_convert=['c_fc', 'out_proj'],
+                                                     trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.to('xpu')
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
                                                      trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
@@ -933,13 +988,7 @@ def run_transformer_int4_gpu_win(repo_id,
                 in_out_len = in_out.split("-")
                 in_len = int(in_out_len[0])
                 out_len = int(in_out_len[1])
-                # As different tokenizer has different encodings,
-                # in_len.txt maybe shorter than we need,
-                # use much longer context to make sure input length
-                test_length = min(in_len*2, 8192)
-                while test_length not in [32, 256, 1024, 2048, 8192]:
-                    test_length = test_length * 2
-                input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+                input_str = get_continuation_input_str(in_len)
                 # As different tokenizer has different encodings,
                 # slice the input_ids to ensure the prompt length is required length.
                 input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1021,6 +1070,21 @@ def run_transformer_int4_fp16_gpu_win(repo_id,
                                           torch_dtype=torch.float16).eval()
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = model.to('xpu')
+    elif repo_id in PHI3VISION_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                     _attn_implementation="eager",
+                                                     modules_to_not_convert=["vision_embed_tokens"],
+                                                     trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding,
+                                                     torch_dtype=torch.float16).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.to('xpu')
+    elif repo_id in QWENVL_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                     modules_to_not_convert=['c_fc', 'out_proj'],
+                                                     trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding,
+                                                     torch_dtype=torch.float16).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.to('xpu')
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
                                                      trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding,
@@ -1041,13 +1105,7 @@ def run_transformer_int4_fp16_gpu_win(repo_id,
                 in_out_len = in_out.split("-")
                 in_len = int(in_out_len[0])
                 out_len = int(in_out_len[1])
-                # As different tokenizer has different encodings,
-                # in_len.txt maybe shorter than we need,
-                # use much longer context to make sure input length
-                test_length = min(in_len*2, 8192)
-                while test_length not in [32, 256, 1024, 2048, 8192]:
-                    test_length = test_length * 2
-                input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+                input_str = get_continuation_input_str(in_len)
                 # As different tokenizer has different encodings,
                 # slice the input_ids to ensure the prompt length is required length.
                 input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1125,6 +1183,19 @@ def run_transformer_int4_loadlowbit_gpu_win(repo_id,
                                                   use_cache=True, cpu_embedding=cpu_embedding).eval()
         tokenizer = AutoTokenizer.from_pretrained(model_path+'-'+low_bit, trust_remote_code=True)
         model = model.to('xpu')
+    elif repo_id in PHI3VISION_IDS:
+        model = AutoModelForCausalLM.load_low_bit(model_path+'-'+low_bit, optimize_model=True, trust_remote_code=True,
+                                                  _attn_implementation="eager",
+                                                  modules_to_not_convert=["vision_embed_tokens"],
+                                                  use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path+'-'+low_bit, trust_remote_code=True)
+        model = model.to('xpu')
+    elif repo_id in QWENVL_IDS:
+        model = AutoModelForCausalLM.load_low_bit(model_path+'-'+low_bit, optimize_model=True, trust_remote_code=True,
+                                                  modules_to_not_convert=['c_fc', 'out_proj'],
+                                                  use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path+'-'+low_bit, trust_remote_code=True)
+        model = model.to('xpu')
     else:
         model = AutoModelForCausalLM.load_low_bit(model_path+'-'+low_bit, optimize_model=True, trust_remote_code=True,
                                                   use_cache=True, cpu_embedding=cpu_embedding).eval()
@@ -1144,13 +1215,7 @@ def run_transformer_int4_loadlowbit_gpu_win(repo_id,
                 in_out_len = in_out.split("-")
                 in_len = int(in_out_len[0])
                 out_len = int(in_out_len[1])
-                # As different tokenizer has different encodings,
-                # in_len.txt maybe shorter than we need,
-                # use much longer context to make sure input length
-                test_length = min(in_len*2, 8192)
-                while test_length not in [32, 256, 1024, 2048, 8192]:
-                    test_length = test_length * 2
-                input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+                input_str = get_continuation_input_str(in_len)
                 # As different tokenizer has different encodings,
                 # slice the input_ids to ensure the prompt length is required length.
                 input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1228,6 +1293,19 @@ def run_transformer_int4_fp16_loadlowbit_gpu_win(repo_id,
                                                   use_cache=True, cpu_embedding=cpu_embedding).eval()
         tokenizer = AutoTokenizer.from_pretrained(model_path+'-'+low_bit, trust_remote_code=True)
         model = model.half().to('xpu')
+    elif repo_id in PHI3VISION_IDS:
+        model = AutoModelForCausalLM.load_low_bit(model_path+'-'+low_bit, optimize_model=True, trust_remote_code=True,
+                                                  _attn_implementation="eager",
+                                                  modules_to_not_convert=["vision_embed_tokens"],
+                                                  use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path+'-'+low_bit, trust_remote_code=True)
+        model = model.half().to('xpu')
+    elif repo_id in QWENVL_IDS:
+        model = AutoModelForCausalLM.load_low_bit(model_path+'-'+low_bit, optimize_model=True, trust_remote_code=True,
+                                                     modules_to_not_convert=['c_fc', 'out_proj'],
+                                                  use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path+'-'+low_bit, trust_remote_code=True)
+        model = model.half().to('xpu')
     else:
         model = AutoModelForCausalLM.load_low_bit(model_path+'-'+low_bit, optimize_model=True, trust_remote_code=True,
                                                   use_cache=True, cpu_embedding=cpu_embedding).eval()
@@ -1247,13 +1325,7 @@ def run_transformer_int4_fp16_loadlowbit_gpu_win(repo_id,
                 in_out_len = in_out.split("-")
                 in_len = int(in_out_len[0])
                 out_len = int(in_out_len[1])
-                # As different tokenizer has different encodings,
-                # in_len.txt maybe shorter than we need,
-                # use much longer context to make sure input length
-                test_length = min(in_len*2, 8192)
-                while test_length not in [32, 256, 1024, 2048, 8192]:
-                    test_length = test_length * 2
-                input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+                input_str = get_continuation_input_str(in_len)
                 # As different tokenizer has different encodings,
                 # slice the input_ids to ensure the prompt length is required length.
                 input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1336,13 +1408,7 @@ def run_transformer_autocast_bf16( repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1407,13 +1473,7 @@ def run_bigdl_ipex_bf16(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1477,13 +1537,7 @@ def run_bigdl_ipex_int4(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1547,13 +1601,7 @@ def run_bigdl_ipex_int8(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1657,13 +1705,7 @@ def run_deepspeed_optimize_model_gpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192] and test_length < 8192:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1734,13 +1776,7 @@ def run_speculative_cpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1812,13 +1848,7 @@ def run_speculative_gpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1899,13 +1929,7 @@ def run_pipeline_parallel_gpu(repo_id,
             in_out_len = in_out.split("-")
             in_len = int(in_out_len[0])
             out_len = int(in_out_len[1])
-            # As different tokenizer has different encodings,
-            # in_len.txt maybe shorter than we need,
-            # use much longer context to make sure input length
-            test_length = min(in_len*2, 8192)
-            while test_length not in [32, 256, 1024, 2048, 8192]:
-                test_length = test_length * 2
-            input_str = open(f"prompt/continuation/{test_length}.txt", 'r').read()
+            input_str = get_continuation_input_str(in_len)
             # As different tokenizer has different encodings,
             # slice the input_ids to ensure the prompt length is required length.
             input_ids = tokenizer.encode(input_str, return_tensors="pt")
@@ -1980,11 +2004,20 @@ if __name__ == '__main__':
         df = pd.DataFrame(results, columns=['model', '1st token avg latency (ms)', '2+ avg latency (ms/token)', 'encoder time (ms)',
                                             'input/output tokens', 'batch_size', 'actual input/output tokens', 'num_beams', 'low_bit', 'cpu_embedding',
                                             'model loading time (s)', 'peak mem (GB)', 'streaming', 'use_fp16_torch_dtype'])
-        df.index += max(line_counter-1, 0)
-        if api not in ["transformer_int4_gpu", "transformer_int4_fp16_gpu"]:
-            if line_counter == 0:
-                df.to_csv(csv_name, mode='a')
-            else:
-                df.to_csv(csv_name, mode='a', header=None)
-        line_counter += len(df.index)
+        if "pipeline" in api or "deepspeed" in api:
+            if torch.distributed.get_rank() == 0:
+                df.index += max(line_counter - 1, 0)
+                if line_counter == 0:
+                    df.to_csv(csv_name, mode='a')
+                else:
+                    df.to_csv(csv_name, mode='a', header=None)
+                line_counter += len(df.index)
+        else:
+            df.index += max(line_counter - 1, 0)
+            if api not in ["transformer_int4_gpu", "transformer_int4_fp16_gpu"]:
+                if line_counter == 0:
+                    df.to_csv(csv_name, mode='a')
+                else:
+                    df.to_csv(csv_name, mode='a', header=None)
+            line_counter += len(df.index)
         results = []

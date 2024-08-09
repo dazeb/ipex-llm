@@ -53,7 +53,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     # Download all-in-one benchmark and examples
     git clone https://github.com/intel-analytics/ipex-llm && \
     cp -r ./ipex-llm/python/llm/dev/benchmark/ ./benchmark && \
-    cp -r ./ipex-llm/python/llm/example/GPU/HF-Transformers-AutoModels/Model ./examples && \
+    cp -r ./ipex-llm/python/llm/example/GPU/HuggingFace/LLM ./examples && \
     # Install vllm dependencies
     pip install --upgrade fastapi && \
     pip install --upgrade "uvicorn[standard]" && \
@@ -61,7 +61,10 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cp -r ./ipex-llm/python/llm/example/GPU/vLLM-Serving/ ./vLLM-Serving && \
     # Download pp_serving
     mkdir -p /llm/pp_serving && \
-    cp ./ipex-llm/python/llm/example/GPU/Pipeline-Parallel-FastAPI/*.py /llm/pp_serving/ && \
+    cp ./ipex-llm/python/llm/example/GPU/Pipeline-Parallel-Serving/*.py /llm/pp_serving/ && \
+    # Download lightweight_serving
+    mkdir -p /llm/lightweight_serving && \
+    cp ./ipex-llm/python/llm/example/GPU/Lightweight-Serving/*.py /llm/lightweight_serving/ && \
     # Install related library of benchmarking
     pip install pandas omegaconf && \
     chmod +x /llm/benchmark.sh && \

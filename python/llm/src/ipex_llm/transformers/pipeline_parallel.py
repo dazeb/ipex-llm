@@ -19,13 +19,17 @@
 
 import torch
 from torch import nn
+from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 import torch.distributed as dist
 import os
 import time
 import numpy as np
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union, Tuple, Any
 from types import SimpleNamespace
+import transformers
 from transformers import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ipex_llm.utils.common import invalidInputError
 from ipex_llm.ggml.quantize import ggml_tensor_qtype
 import logging
@@ -33,6 +37,7 @@ logger = logging.getLogger(__name__)
 import asyncio
 import uuid
 import threading
+import pickle
 try:
     from pydantic import BaseModel
 except ImportError:
@@ -49,7 +54,7 @@ class DummyLayer(nn.Module):
         super().__init__()
         # to avoid AttributeError in https://github.com/intel-analytics/ipex-llm/blob/main/
         # python/llm/src/ipex_llm/transformers/models/llama.py#L2076
-        self.weight = torch.randn(1,)
+        self.weight = nn.Parameter(torch.empty(0,), requires_grad=False)
 
     def forward(self, x):
         return x
@@ -107,6 +112,34 @@ def init_pipeline_parallel():
     dist.init_process_group('ccl')
 
 
+def low_mem_convert(model):
+    from ipex_llm.transformers.convert import convert_forward
+    import importlib
+    if 'llama' in model.config.model_type:
+        convert_forward(
+            model,
+            transformers.models.llama.modeling_llama.LlamaForCausalLM,
+            llama_causallm_forward_4_37_lowmem)
+    elif model.config.model_type == "chatglm" and not hasattr(model.config, "vision_config"):
+        if model.config.num_layers == 40:
+            # for glm4-9b
+            modeling_module_name = model.__class__.__module__
+            module = importlib.import_module(modeling_module_name)
+            convert_forward(
+                model,
+                module.ChatGLMForConditionalGeneration,
+                glm4_conditional_generation_forward_lowmem)
+        else:
+            # for chatglm3-6b
+            modeling_module_name = model.__class__.__module__
+            module = importlib.import_module(modeling_module_name)
+            convert_forward(
+                model,
+                module.ChatGLMForConditionalGeneration,
+                chatglm3_conditional_generation_forward_lowmem)
+    return model
+
+
 def _check_quantize_kv_cache(model, idx, batch_size):
     # align use_quantize_kv_cache setting for different GPU in pipeline parallel
     pp_quantize_kv_cache = (os.environ.get("BIGDL_QUANTIZE_KV_CACHE", None) == "1") or \
@@ -130,7 +163,7 @@ def _check_quantize_kv_cache(model, idx, batch_size):
         os.environ["IPEX_LLM_QUANTIZE_KV_CACHE"] = "0"
 
 
-def pipeline_parallel(model, pipeline_parallel_stages):
+def pipeline_parallel(model, pipeline_parallel_stages, torch_dtype=torch.float32):
     global num_layers
     if hasattr(model.config, 'num_hidden_layers'):
         num_layers = model.config.num_hidden_layers
@@ -186,10 +219,17 @@ def pipeline_parallel(model, pipeline_parallel_stages):
             model._modules['model'].norm = DummyLayer()
             model._modules['lm_head'] = DummyLayer()
 
+    _enable_lowmem = os.getenv('IPEX_LLM_LOW_MEM')
+    _enable_lowmem = (_enable_lowmem is not None) and (_enable_lowmem.lower() == "1")
+    if _enable_lowmem:
+        model = low_mem_convert(model)
+
     model.pipeline_parallel_stages = pipeline_parallel_stages
     model.layer_start = layer_start
     model.layer_end = layer_end
     model.num_layers = num_layers
+    if torch_dtype == torch.float16:
+        model = model.half()
     model = model.to(f'xpu:{local_rank}')
     return model
 
@@ -229,13 +269,14 @@ def generate(
             generation_config.pad_token_id = eos_token_id
 
         if generation_config is not None and generation_config.max_new_tokens is not None:
-            max_new_tokens = generation_config.max_new_tokens
+            max_new_tokens = generation_config.pop("max_new_tokens")
         else:
-            max_new_tokens = kwargs.get("max_new_tokens", None)
+            max_new_tokens = kwargs.pop("max_new_tokens", None)
 
         return self.pipeline_parallel_generate(inputs=inputs,
                                                max_new_tokens=max_new_tokens,
-                                               generation_config=generation_config,)
+                                               generation_config=generation_config,
+                                               **kwargs)
 
     return original_generate(self,
                              inputs=inputs,
@@ -257,6 +298,23 @@ def pipeline_parallel_generate(self,
                                max_new_tokens: int = 32,
                                generation_config: Optional[GenerationConfig] = None,
                                **kwargs):
+    model_kwargs = generation_config.update(**kwargs)
+    inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
+        inputs, generation_config.bos_token_id, model_kwargs
+    )
+    bs = inputs_tensor.shape[0]
+    if self.config.is_encoder_decoder:
+        input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
+            batch_size=bs,
+            model_input_name=model_input_name,
+            model_kwargs=model_kwargs,
+            decoder_start_token_id=generation_config.decoder_start_token_id,
+            bos_token_id=generation_config.bos_token_id,
+            device=inputs_tensor.device,
+        )
+    else:
+        input_ids = inputs_tensor if model_input_name == "input_ids" \
+            else model_kwargs.pop("input_ids")
     local_rank = dist.get_rank()
     pre_rank = (local_rank - 1) % self.pipeline_parallel_stages
     next_rank = (local_rank + 1) % self.pipeline_parallel_stages
@@ -272,36 +330,44 @@ def pipeline_parallel_generate(self,
     eos_token_id = generation_config.eos_token_id
     if isinstance(eos_token_id, int):
         eos_token_id = [eos_token_id]
-    eos_token_id_tensor = torch.tensor(eos_token_id).to(inputs.device) \
+    eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) \
         if eos_token_id is not None else None
 
     _input_ids = None
     _past_key_values = None
-    bs = inputs.shape[0]
-    output_ids = inputs.clone()
+
+    bs = input_ids.shape[0]
+    output_ids = input_ids.clone()
     _check_quantize_kv_cache(self, layer_start, bs)
 
     step = 0
     # keep track of which sequences are already finished
-    unfinished_sequences = torch.ones(inputs.shape[0], dtype=torch.long, device=inputs.device)
+    unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
     this_peer_finished = False
     while True:
         if step >= max_new_tokens:
             break
 
         if _input_ids is None:
-            _input_ids = inputs
+            _input_ids = input_ids
 
         tic = time.time()
         if local_rank == 0:
             outputs = self(input_ids=_input_ids, inputs_embeds=None,
-                           past_key_values=_past_key_values, use_cache=True)
+                           past_key_values=_past_key_values, use_cache=True, **model_kwargs)
         else:
-            inputs_embeds = torch.empty(_input_ids.shape + (self.config.hidden_size,),
+            _inputs_shape = _input_ids.shape + (self.config.hidden_size,)
+            if step == 0 and self.config.model_type == "chatglm" \
+               and hasattr(self.config, "vision_config"):
+                # for glm-4v, image features are mapped during 1st token
+                # 1597 are computed according to computation process of conv
+                _images_feature = 1597 + _input_ids.shape[0] * 2 + _input_ids.shape[1]
+                _inputs_shape = (_input_ids.shape[0], _images_feature, self.config.hidden_size,)
+            inputs_embeds = torch.empty(_inputs_shape,
                                         device=f'xpu:{local_rank}', dtype=self.dtype)
             dist.recv(inputs_embeds, src=pre_rank)
             outputs = self(input_ids=None, inputs_embeds=inputs_embeds,
-                           past_key_values=_past_key_values, use_cache=True)
+                           past_key_values=_past_key_values, use_cache=True, **model_kwargs)
 
         if local_rank == self.pipeline_parallel_stages - 1:
             logits = outputs.logits
@@ -323,7 +389,8 @@ def pipeline_parallel_generate(self,
                                          "make sure that `pad_token_id` is defined.")
             next_ids = next_ids * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
-        if self.config.model_type == "chatglm" and self.config.num_layers == 40:
+        if self.config.model_type == "chatglm" and self.config.num_layers == 40 \
+           and not hasattr(self.config, "vision_config"):
             # for glm-4-9b-chat
             if step == 0:
                 value_placeholder = torch.empty_like((outputs.past_key_values)[-1][0])
@@ -337,7 +404,7 @@ def pipeline_parallel_generate(self,
                 _past_key_values = outputs.past_key_values
         elif self.config.model_type in ["baichuan", "chatglm"] or \
                 (self.config.model_type == "qwen" and hasattr(self.config, "visual")):
-            # for baichuan2, chatglm3, Qwen-VL-Chat
+            # for baichuan2, chatglm3, Qwen-VL-Chat, glm-4v-9b
             if local_rank != 0:
                 value_placeholder = torch.empty_like((outputs.past_key_values)[-1][0])
                 past_key_values_placeholder = tuple(
@@ -396,15 +463,19 @@ class BatchTask(BaseModel):
     partial_prefilling: int
 
 
-def make_attention_mask(prompt_lengths):
+def make_attention_mask(prompt_lengths, device):
     max_length = max(prompt_lengths)
-    attention_mask = torch.zeros((len(prompt_lengths), max_length), dtype=torch.int64)
-    for i, length in enumerate(prompt_lengths):
-        attention_mask[i, max_length - length:] = 1
+    batch_size = len(prompt_lengths)
+
+    range_tensor = torch.arange(max_length, device=device).expand(batch_size, max_length)
+    prompt_lengths_tensor = torch.tensor(prompt_lengths, device=device).unsqueeze(1)
+    attention_mask = range_tensor >= max_length - prompt_lengths_tensor
+    attention_mask = attention_mask.to(torch.int64)
+
     return attention_mask
 
 
-class ModelRunner:
+class PPModelWorker:
     """Implementation for pipeline parallel multi-stage serving."""
     def __init__(self, checkpoint, rank, world_size, low_bit, max_num_seqs, max_prefilled_seqs,
                  torch_dtype=torch.float16):
@@ -435,11 +506,15 @@ class ModelRunner:
         self.print_len = {}
         self.is_finish = {}
         self.model_name = checkpoint
+
+        self.device = f"xpu:{self.rank}"
         # self.layer_start = 0
         # self.layer_end = 0
 
         self.max_prefilled_seqs = max_prefilled_seqs
         self.partial_output_dict = {}
+
+        self.stream_tasks = {}
 
     def load_model(self, model_path, world_size, low_bit='sym_int4'):
         from ipex_llm.transformers import AutoModelForCausalLM, AutoModel
@@ -447,6 +522,7 @@ class ModelRunner:
             model = AutoModelForCausalLM.from_pretrained(model_path,
                                                          load_in_low_bit=low_bit,
                                                          torch_dtype=self.dtype,
+                                                         cpu_embedding=True,
                                                          optimize_model=True,
                                                          trust_remote_code=True,
                                                          use_cache=True,
@@ -476,7 +552,7 @@ class ModelRunner:
         return cur_batch
 
     def cat_kv_cache(self, model_type, kv_cache_1, kv_cache_2):
-        if model_type in ["baichuan", "chatglm"]:
+        if model_type in ["baichuan", "chatglm", "mixtral"]:
             result = []
             for sub_tuple1, sub_tuple2 in zip(kv_cache_1, kv_cache_2):
                 if sub_tuple1 is None:
@@ -499,7 +575,8 @@ class ModelRunner:
             return tuple(result)
         else:
             # num_layers = self.model.layer_end - self.model.layer_start
-            for layer_idx in range(self.model.num_layers):
+            num_cache = min(len(kv_cache_1.key_cache), self.model.num_layers)
+            for layer_idx in range(num_cache):
                 kv_cache_1.key_cache[layer_idx] = \
                     torch.cat([kv_cache_1.key_cache[layer_idx],
                                kv_cache_2.key_cache[layer_idx]], dim=0)
@@ -509,14 +586,14 @@ class ModelRunner:
 
             return kv_cache_1
 
-    def update_kv_cache(self, kv_cache, cur_id):
+    def update_kv_cache(self, kv_cache, prefill=False):
         layer_start = self.model.layer_start
         layer_end = self.model.layer_end
         num_layers = self.model.num_layers
 
         if self.model.config.model_type == "chatglm" and self.model.config.num_layers == 40:
             # for glm-4-9b-chat
-            if self.past_key_values_dict.get(cur_id, None) is None:
+            if prefill:
                 value_placeholder = torch.empty_like((kv_cache)[-1][0])
                 past_key_values_placeholder = tuple(
                     (value_placeholder, value_placeholder) for _ in range(layer_start)
@@ -528,13 +605,10 @@ class ModelRunner:
                 pass
         elif self.model.config.model_type in ["baichuan", "chatglm"] and self.rank > 0:
             value_placeholder = torch.empty_like((kv_cache)[-1][0])
-            kv_cache = tuple((value_placeholder, value_placeholder)) + \
-                tuple(None for _ in range(layer_start)) + \
-                (kv_cache)[layer_start:]
-            # past_key_values_placeholder = tuple(
-            #     (value_placeholder, value_placeholder) for _ in range(layer_start)
-            # ) + (kv_cache)[layer_start:]
-            # kv_cache = past_key_values_placeholder
+            past_key_values_placeholder = tuple(
+                (value_placeholder, value_placeholder) for _ in range(layer_start)
+            ) + (kv_cache)[layer_start:]
+            kv_cache = past_key_values_placeholder
         else:
             pass
 
@@ -548,7 +622,7 @@ class ModelRunner:
         # logger.info(f"{self.rank} {cur_batch} {input.shape}")
         cur_id = cur_batch.batch_id
         _past_key_values = self.past_key_values_dict.get(cur_id, None)
-        attention_mask = make_attention_mask(cur_batch.prompt_lengths).to(input.device)
+        attention_mask = make_attention_mask(cur_batch.prompt_lengths, input.device)
 
         if self.rank == 0:
             input_ids = input
@@ -572,7 +646,7 @@ class ModelRunner:
                 tmp_past_key_values = _past_key_values
                 _past_key_values = None
 
-        # torch.xpu.empty_cache()
+        torch.xpu.empty_cache()
         output = self.model(input_ids=input_ids,
                             inputs_embeds=inputs_embeds,
                             past_key_values=_past_key_values,
@@ -590,13 +664,13 @@ class ModelRunner:
                 # torch.xpu.empty_cache()
 
             if cur_batch.prefilled_index == cur_batch.batch_size:
-                tmp_past_key_values = self.update_kv_cache(tmp_past_key_values, cur_id)
+                tmp_past_key_values = self.update_kv_cache(tmp_past_key_values, True)
 
             self.past_key_values_dict[cur_id] = tmp_past_key_values
 
             if self.pp_config.is_tail:
                 _pre_output = self.partial_output_dict.get(cur_id, None)
-                tmp_output = output.logits.to(self.dtype)
+                tmp_output = output.logits
                 tmp_output = torch.argmax(tmp_output[:, -1:, :], dim=-1)
                 if _pre_output is None:
                     _pre_output = tmp_output
@@ -604,20 +678,22 @@ class ModelRunner:
                     _pre_output = torch.cat((_pre_output, tmp_output), dim=0)
                 self.partial_output_dict[cur_id] = _pre_output
         else:
-            _past_key_values = self.update_kv_cache(output.past_key_values, cur_id)
+            _prefill = self.past_key_values_dict.get(cur_id, None) is None
+            _past_key_values = self.update_kv_cache(output.past_key_values, prefill=_prefill)
             self.past_key_values_dict[cur_id] = _past_key_values
         torch.xpu.synchronize()
         if not self.pp_config.is_tail:
-            return output[0].to(self.dtype), cur_batch
+            _output = output[0]
+            if _output.dtype != self.dtype:
+                _output = _output.to(self.dtype)
         else:
             if cur_batch.partial_prefilling > 0 and \
                cur_batch.prefilled_index == cur_batch.batch_size:
                 _output = self.partial_output_dict.pop(cur_id, None)
                 cur_batch.partial_prefilling = 0
-                return _output, cur_batch
             else:
                 _output = torch.argmax(output.logits[:, -1:, :], dim=-1)
-                return _output, cur_batch
+        return _output, cur_batch
 
     def is_initialized(self):
         return True
@@ -633,14 +709,14 @@ class ModelRunner:
             request_ids.append(request_id)
             prompt_requests.append(prompt_request)
 
-        plain_texts = [req.prompt for req in prompt_requests]
+        plain_texts = [req.inputs for req in prompt_requests]
         inputs = tokenizer(plain_texts, return_tensors="pt", padding=True)
         input_ids = inputs.input_ids.to(f'xpu:{self.rank}')
         attention_mask = inputs.attention_mask.to(f'xpu:{self.rank}')
         new_batch = BatchTask(
             batch_id="batch_" + str(uuid.uuid4()),
             request_ids=request_ids,
-            max_tokens=max([req.n_predict for req in prompt_requests]),
+            max_tokens=max([req.parameters.max_new_tokens for req in prompt_requests]),
             batch_size=input_ids.size(0),
             input_len=input_ids.size(1),
             prompt_lengths=[sum(attention_mask[i, :]) for i in range(input_ids.size(0))],
@@ -663,14 +739,71 @@ class ModelRunner:
         self.is_finish.pop(cur_id, None)
         self.partial_output_dict.pop(cur_id, None)
 
+    async def wait_stream_output(self, cur_id):
+        cur_task = self.stream_tasks.pop(cur_id, None)
+        if cur_task is not None:
+            await cur_task
+
+    def get_printable_text(self, cur_text, request_id):
+        if cur_text.endswith("\n"):
+            printable_text = cur_text[self.print_len[request_id]:]
+            self.token_cache[request_id] = []
+            self.print_len[request_id] = 0
+        elif len(cur_text) > 0 and _is_chinese_char(ord(cur_text[-1])):
+            printable_text = cur_text[self.print_len[request_id]:]
+            self.print_len[request_id] += len(printable_text)
+            self.token_cache[request_id] = []
+            self.print_len[request_id] = 0
+        else:
+            r_index = cur_text.rfind(" ") + 1
+            if r_index > self.print_len[request_id]:
+                printable_text = cur_text[self.print_len[request_id]: r_index]
+                self.token_cache[request_id] = self.token_cache[request_id][-1:]
+                self.print_len[request_id] = 0
+            else:
+                printable_text = cur_text[self.print_len[request_id]: r_index]
+        return printable_text
+
+    async def stream_output(self, cur_batch, tokenizer, next_ids):
+        cur_id = cur_batch.batch_id
+        cur_cached_ids = []
+        _stream_tasks = []
+        for index, request_id in enumerate(cur_batch.request_ids):
+            if not self.is_finish.get(request_id, False):
+                if self.token_cache.get(request_id, None) is None:
+                    self.token_cache[request_id] = []
+                    self.print_len[request_id] = 0
+                self.token_cache[request_id].extend(next_ids[index].tolist())
+                cur_cached_ids.append(self.token_cache[request_id])
+
+        for index, request_id in enumerate(cur_batch.request_ids):
+            if not self.is_finish.get(request_id, False):
+                remain = cur_batch.max_tokens - len(self.tokens[cur_id])
+
+                if self.streamer.get(request_id, None) is None:
+                    self.streamer[request_id] = asyncio.Queue()
+
+                # Currently ignore eos for benchmark
+                # if next_ids[index].int() == tokenizer.eos_token_id:
+                #     remain = 0
+                #     self.is_finish[request_id] = True
+
+                cur_text = tokenizer.decode(self.token_cache[request_id])
+                printable_text = self.get_printable_text(cur_text, request_id)
+
+                if remain > 0:
+                    _stream_tasks.append(self.streamer[request_id].put((remain, printable_text)))
+                else:
+                    printable_text = printable_text + cur_text[self.print_len[request_id]:]
+                    self.token_cache.pop(request_id, None)
+                    self.print_len.pop(request_id, None)
+                    _stream_tasks.append(self.streamer[request_id].put((remain, printable_text)))
+        await asyncio.gather(*_stream_tasks)
+
     async def process_step(self, tokenizer, result_dict):
         cur_batch = None
-
+        torch.xpu.synchronize(self.device)
         if self.rank == 0:
-            if self.send_buff is not None:
-                # logger.info(f"send {self.rank} {self.send_buff.shape}")
-                dist.send(self.send_buff, dst=self.next_rank)
-
             if self.on_going_batches[0] is not None:
                 cur_batch = self.on_going_batches[0]
                 cur_input = None
@@ -687,7 +820,6 @@ class ModelRunner:
 
             if (cur_batch is not None) and (not cur_batch.stopped) and (cur_input is None):
                 cur_id = cur_batch.batch_id
-                # cur_batch = self.prepare_batch(cur_batch)
                 if cur_batch.prefilled_index >= cur_batch.batch_size:
                     cur_batch.partial_prefilling = 0
                 if cur_batch.partial_prefilling > 0:
@@ -699,13 +831,13 @@ class ModelRunner:
 
                 # logger.info(f"recv {self.rank} {next_ids.shape}")
                 dist.recv(next_ids, src=self.pre_rank)
+                torch.xpu.synchronize(self.device)
 
                 if cur_batch.partial_prefilling > 0:
                     cur_input = self.input_ids_dict[cur_batch.batch_id]
                 else:
                     if self.tokens.get(cur_id, None) is None:
                         self.tokens[cur_id] = []
-
                     if len(next_ids.shape) == 1:
                         next_ids = next_ids.unsqueeze(0)
                     self.tokens[cur_id].append(next_ids)
@@ -714,44 +846,14 @@ class ModelRunner:
                     cur_batch.input_len = 1
                     cur_batch.prompt_lengths = [x + 1 for x in cur_batch.prompt_lengths]
 
-                    for index, request_id in enumerate(cur_batch.request_ids):
-
-                        if not self.is_finish.get(request_id, False):
-                            remain = cur_batch.max_tokens - len(self.tokens[cur_id])
-
-                            if self.streamer.get(request_id, None) is None:
-                                self.streamer[request_id] = asyncio.Queue()
-
-                            # Currently ignore eos for benchmark
-                            # if next_ids[index].int() == tokenizer.eos_token_id:
-                            #     remain = 0
-                            #     self.is_finish[request_id] = True
-
-                            if self.token_cache.get(request_id, None) is None:
-                                self.token_cache[request_id] = []
-                                self.print_len[request_id] = 0
-                            self.token_cache[request_id].extend(next_ids[index].tolist())
-
-                            text = tokenizer.decode(self.token_cache[request_id])
-                            if text.endswith("\n"):
-                                printable_text = text[self.print_len[request_id]:]
-                                self.token_cache[request_id] = []
-                                self.print_len[request_id] = 0
-                            elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
-                                printable_text = text[self.print_len[request_id]:]
-                                self.print_len[request_id] += len(printable_text)
-                            else:
-                                r_index = text.rfind(" ") + 1
-                                printable_text = text[self.print_len[request_id]: r_index]
-                                self.print_len[request_id] += len(printable_text)
-
-                            if remain > 0:
-                                await self.streamer[request_id].put((remain, printable_text))
-                            else:
-                                printable_text = printable_text + text[self.print_len[request_id]:]
-                                self.token_cache.pop(request_id, None)
-                                self.print_len.pop(request_id, None)
-                                await self.streamer[request_id].put((remain, printable_text))
+                    pre_task = self.stream_tasks.get(cur_id)
+                    if pre_task is not None:
+                        await pre_task
+                        del self.stream_tasks[cur_id]
+                    cur_task = asyncio.create_task(
+                        self.stream_output(cur_batch, tokenizer, next_ids)
+                    )
+                    self.stream_tasks[cur_id] = cur_task
 
                     if len(self.tokens[cur_id]) >= cur_batch.max_tokens:
                         # Finish a batch
@@ -767,6 +869,7 @@ class ModelRunner:
                         next_token = (cur_times[-1] - cur_times[1]) / (len(self.tokens[cur_id]) - 1)
                         logger.info(f"First token latency: {first_token}, "
                                     f"next token latency: {next_token}")
+                        await self.wait_stream_output(cur_id)
                         self.clear_batch(cur_id)
                         cur_batch.stopped = True
             else:
@@ -776,15 +879,12 @@ class ModelRunner:
             if cur_batch is not None:
                 cur_batch = self.prepare_batch(cur_batch)
                 dist.broadcast_object_list([cur_batch], src=0)
+            else:
+                await asyncio.sleep(0)
 
         else:
-            if self.send_buff is not None:
-                # logger.info(f"send {self.rank} {self.send_buff.shape}")
-                dist.send(self.send_buff, dst=self.next_rank)
-
             batch_list = [None]
             dist.broadcast_object_list(batch_list, src=0)
-
             cur_batch = batch_list[0]
             cur_input = None
 
@@ -808,16 +908,16 @@ class ModelRunner:
                         )
                     # logger.info(f"recv {self.rank} {cur_input.shape}")
                     dist.recv(cur_input, src=self.pre_rank)
+                    torch.xpu.synchronize(self.device)
 
         output, cur_batch = self.model_step(cur_input, cur_batch)
-        # if output is not None and self.rank == self.world_size - 1:
-        #     output = torch.argmax(output[:, -1:, :], dim=-1)
 
+        torch.xpu.synchronize(self.device)
+        if self.send_buff is not None:
+            self.send_buff.wait()
         if output is not None:
-            # dist.send(output, dst=self.next_rank)
-            self.send_buff = output
-        else:
-            self.send_buff = None
+            self.send_buff = dist.isend(output, dst=self.next_rank)
+
         if self.rank == 0:
             self.on_going_batches[:-1] = self.on_going_batches[1:]
             self.on_going_batches[self.world_size - 1] = cur_batch
@@ -846,3 +946,212 @@ def _is_chinese_char(cp):
         return True
 
     return False
+
+
+def llama_causallm_forward_4_37_lowmem(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, CausalLMOutputWithPast]:
+
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions  # noqa
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states  # noqa
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
+
+    hidden_states = outputs[0]
+
+    # ipex-llm change starts
+
+    if self.config.pretraining_tp > 1:
+        lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)  # noqa
+        logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]  # noqa
+        logits = torch.cat(logits, dim=-1)
+    else:
+        # Only empty cache for first token
+        if hidden_states.shape[1] > 1:
+            torch.xpu.empty_cache()
+        logits = self.lm_head(hidden_states)
+        # Only empty cache for first token
+        if hidden_states.shape[1] > 1:
+            torch.xpu.empty_cache()
+    # logits = logits.float()
+
+    # ipex-llm change ends
+
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return (loss,) + output if loss is not None else output
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
+def chatglm3_conditional_generation_forward_lowmem(
+    self,
+    input_ids: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.Tensor] = None,
+    labels: Optional[torch.Tensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    return_last_logit: Optional[bool] = False,
+):
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    transformer_outputs = self.transformer(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
+
+    hidden_states = transformer_outputs[0]
+    if return_last_logit:
+        hidden_states = hidden_states[-1:]
+
+    # ipex-llm change starts
+    torch.xpu.empty_cache()
+    lm_logits = self.transformer.output_layer(hidden_states)
+    torch.xpu.empty_cache()
+    lm_logits = lm_logits.transpose(0, 1).contiguous()
+
+    loss = None
+    if labels is not None:
+        # lm_logits = lm_logits.to(torch.float32)
+
+        # Shift so that tokens < n predict n
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        lm_logits = lm_logits.to(hidden_states.dtype)
+        loss = loss.to(hidden_states.dtype)
+    # ipex-llm change ends
+
+    if not return_dict:
+        output = (lm_logits,) + transformer_outputs[1:]
+        return ((loss,) + output) if loss is not None else output
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=lm_logits,
+        past_key_values=transformer_outputs.past_key_values,
+        hidden_states=transformer_outputs.hidden_states,
+        attentions=transformer_outputs.attentions,
+    )
+
+
+def glm4_conditional_generation_forward_lowmem(
+    self,
+    input_ids: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.Tensor] = None,
+    labels: Optional[torch.Tensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    return_last_logit: Optional[bool] = False,
+):
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    transformer_outputs = self.transformer(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
+
+    hidden_states = transformer_outputs[0]
+    if return_last_logit:
+        hidden_states = hidden_states[:, -1:]
+    # ipex-llm change starts
+    torch.xpu.empty_cache()
+    lm_logits = self.transformer.output_layer(hidden_states)
+    torch.xpu.empty_cache()
+
+    loss = None
+    if labels is not None:
+        # lm_logits = lm_logits.to(torch.float32)
+
+        # Shift so that tokens < n predict n
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        lm_logits = lm_logits.to(hidden_states.dtype)
+        loss = loss.to(hidden_states.dtype)
+    # ipex-llm change ends
+
+    if not return_dict:
+        output = (lm_logits,) + transformer_outputs[1:]
+        return ((loss,) + output) if loss is not None else output
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=lm_logits,
+        past_key_values=transformer_outputs.past_key_values,
+        hidden_states=transformer_outputs.hidden_states,
+        attentions=transformer_outputs.attentions,
+    )

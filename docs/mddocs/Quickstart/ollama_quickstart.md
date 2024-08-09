@@ -72,6 +72,9 @@ You may launch the Ollama service as below:
   export ZES_ENABLE_SYSMAN=1
   source /opt/intel/oneapi/setvars.sh
   export SYCL_CACHE_PERSISTENT=1
+  export SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+  # [optional] if you want to run on single GPU, use below command to limit GPU may improve performance
+  export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
   ./ollama serve
   ```
@@ -85,6 +88,7 @@ You may launch the Ollama service as below:
   set no_proxy=localhost,127.0.0.1
   set ZES_ENABLE_SYSMAN=1
   set SYCL_CACHE_PERSISTENT=1
+  set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
 
   ollama serve
   ```
@@ -92,15 +96,11 @@ You may launch the Ollama service as below:
 > [!NOTE]
 > Please set environment variable `OLLAMA_NUM_GPU` to `999` to make sure all layers of your model are running on Intel GPU, otherwise, some layers may run on CPU.
 
-> [!TIP]
-> If your local LLM is running on Intel Arc™ A-Series Graphics with Linux OS (Kernel 6.2), it is recommended to additionaly set the following environment variable for optimal performance before executing `ollama serve`:
->
-> ```bash
-> export SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
-> ```
-
 > [!NOTE]
 > To allow the service to accept connections from all IP addresses, use `OLLAMA_HOST=0.0.0.0 ./ollama serve` instead of just `./ollama serve`.
+
+> [!TIP]
+> When your machine has multi GPUs and you want to run on one of them, you need to set `ONEAPI_DEVICE_SELECTOR=level_zero:[gpu_id]`, here `[gpu_id]` varies based on your requirement. For more details, you can refer to [this section](../Overview/KeyFeatures/multi_gpus_selection.md#2-oneapi-device-selector).
 
 The console will display messages similar to the following:
 
@@ -183,3 +183,24 @@ An example process of interacting with model with `ollama run example` looks lik
 <a href="https://llm-assets.readthedocs.io/en/latest/_images/ollama_gguf_demo_image.png" target="_blank">
   <img src="https://llm-assets.readthedocs.io/en/latest/_images/ollama_gguf_demo_image.png" width=100%; />
 </a>
+
+### Troubleshooting
+
+#### Why model is always loaded again after several minutes
+Ollama will unload model from gpu memory in every 5 minutes as default. For latest version of ollama, you could set `OLLAMA_KEEP_ALIVE=-1` to keep the model loaded in memory. Reference issue: https://github.com/intel-analytics/ipex-llm/issues/11608
+
+#### `exit status 0xc0000135` error when executing  `ollama serve`
+When executing `ollama serve`, if you meet `llama runner process has terminated: exit status 0xc0000135` on Windows or you meet `ollama_llama_server: error while loading shared libraries: libmkl_core.so.2: cannot open shared object file` on Linux, this is most likely caused by the lack of sycl dependency. Please check:
+
+1. if you have installed conda and if you are in the right conda environment which has pip installed oneapi dependencies on Windows
+2. if you have executed `source /opt/intel/oneapi/setvars.sh` on Linux
+
+#### Program hang during initial model loading stage
+When launching `ollama serve` for the first time on Windows, it may get stuck during the model loading phase. If you notice that the program is hanging for a long time during the first run, you can manually input a space or other characters on the server side to ensure the program is running.
+
+#### How to distinguish the community version of Ollama from the ipex-llm version of Ollama
+In the server log of community version of Ollama, you may see `source=payload_common.go:139 msg="Dynamic LLM libraries [rocm_v60000 cpu_avx2 cuda_v11 cpu cpu_avx]"`.
+But in the server log of ipex-llm version of Ollama, you should only see `source=payload.go:44 msg="Dynamic LLM libraries [cpu cpu_avx cpu_avx2]"`.
+
+#### Ollama hang when multiple different questions is asked or context is long
+If you find ollama hang when multiple different questions is asked or context is long, and you see `update_slots : failed to free spaces in the KV cache` in the server log, this could be because that sometimes the LLM context is larger than the default `n_ctx` value, you may increase the `n_ctx` and try it again.

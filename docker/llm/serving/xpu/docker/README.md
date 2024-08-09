@@ -23,7 +23,6 @@ export DOCKER_IMAGE=intelanalytics/ipex-llm-serving-xpu:2.1.0-SNAPSHOT
 sudo docker run -itd \
         --net=host \
         --device=/dev/dri \
-        --memory="32G" \
         --name=CONTAINER_NAME \
         --shm-size="16g" \
         $DOCKER_IMAGE
@@ -44,6 +43,14 @@ root@arda-arc12:/# sycl-ls
 After the container is booted, you could get into the container through `docker exec`.
 
 Currently, we provide two different serving engines in the image, which are FastChat serving engine and vLLM serving engine.
+
+
+#### Lightweight serving engine
+
+To run Lightweight serving on one intel gpu using `IPEX-LLM` as backend, you can refer to this [readme](https://github.com/intel-analytics/ipex-llm/tree/main/python/llm/example/GPU/Lightweight-Serving).
+
+For convenience, we have included a file `/llm/start-lightweight_serving-service` in the image.
+
 
 #### Pipeline parallel serving engine
 

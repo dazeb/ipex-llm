@@ -37,6 +37,7 @@
 # limitations under the License.
 #
 
+import os
 import math
 from typing import Optional, Tuple, Union, List
 
@@ -44,10 +45,12 @@ import torch
 from torch.nn import CrossEntropyLoss
 from torch.nn.functional import scaled_dot_product_attention as sdpa
 
+from ipex_llm.transformers.models.utils import SILU, mlp_fusion_check
 from ipex_llm.transformers.models.utils import should_use_fuse_rope
-from ipex_llm.transformers.models.utils import use_quantize_kv_cache, restore_fp8_kv_cache
+from ipex_llm.transformers.models.utils import use_quantize_kv_cache, restore_fp8_kv_cache, \
+    should_use_compresskv, is_enough_kv_cache_room_4_36
 from ipex_llm.transformers.models.utils import use_flash_attention, use_sdp, use_sdp_causal
-from ipex_llm.transformers.kv import DynamicFp8Cache, DynamicNormalCache
+from ipex_llm.transformers.kv import DynamicFp8Cache, DynamicNormalCache, DynamicCompressCache
 from ipex_llm.utils.common import invalidInputError
 
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
@@ -55,7 +58,7 @@ from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repea
 from transformers.models.qwen2.modeling_qwen2 import _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.models.qwen2.modeling_qwen2 import _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache
 from transformers import logging
 
 
@@ -112,13 +115,20 @@ def qwen2_model_forward(
     inputs = input_ids if input_ids is not None else inputs_embeds
     use_quantize_kv = (
         self.config.hidden_size != 3584     # disable quantize kv in specific model
-        and use_quantize_kv_cache(self.layers[0].mlp.up_proj, inputs)
+        and use_quantize_kv_cache(self.layers[0].mlp.up_proj, inputs,
+                                  self.config.num_attention_heads//self.config.num_key_value_heads)
     )
+    use_compress_kv = should_use_compresskv(inputs, inputs.shape[-1])
 
     if use_cache:
         if use_quantize_kv and not isinstance(past_key_values, DynamicFp8Cache):
             past_key_values = DynamicFp8Cache.from_legacy_cache(past_key_values)
-        if not use_quantize_kv and not isinstance(past_key_values, DynamicNormalCache):
+        elif not use_quantize_kv and use_compress_kv and not isinstance(past_key_values,
+                                                                        DynamicCompressCache):
+            past_key_values = DynamicCompressCache.from_legacy_cache(past_key_values)
+        if not use_quantize_kv and not use_compress_kv and not isinstance(past_key_values,
+                                                                          (DynamicNormalCache,
+                                                                           DynamicCompressCache)):
             past_key_values = DynamicNormalCache.from_legacy_cache(past_key_values)
         past_key_values_length = past_key_values.get_usable_length(seq_length)
     # ipex-llm changes end
@@ -339,20 +349,9 @@ def merge_qkv(module: torch.nn.Module):
 
         del module.q_proj, module.k_proj, module.v_proj
 
-        # Qwen2 uses pre-computed rope table to accelerate rope,
-        # original `cos_cached` and `sin_cached` are added by `register_buffer`,
-        # so they will move to xpu during `model.to('xpu')`.
-        # But gpu fuse kernel doesn't need this rope table, only cpu needs them,
-        # so delete them then add them with `=`, so that they will be pinned on CPU,
-        # this can save about 0.5GB gpu memory usage when running Qwen2
-        if hasattr(module.rotary_emb, "cos_cached"):
-            cos_cached = module.rotary_emb.cos_cached
+        if os.environ.get("IPEX_LLM_LOW_MEM", None) == "1":
             del module.rotary_emb.cos_cached
-            module.rotary_emb.cos_cached = cos_cached
-        if hasattr(module.rotary_emb, "sin_cached"):
-            sin_cached = module.rotary_emb.sin_cached
             del module.rotary_emb.sin_cached
-            module.rotary_emb.sin_cached = sin_cached
 
 
 def padding_mlp(module: torch.nn.Module):
@@ -402,6 +401,10 @@ def qwen2_attention_forward(
     bsz, q_len, _ = hidden_states.size()
     device = hidden_states.device
 
+    # [CompressKV]
+    from ipex_llm.transformers.kv import DynamicCompressCache
+    use_compresskv = isinstance(past_key_value, DynamicCompressCache)
+
     if hasattr(self, 'qkv_proj') and self.qkv_proj is not None:
         qkv = self.qkv_proj(hidden_states)
         qkv = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
@@ -435,8 +438,17 @@ def qwen2_attention_forward(
                                                         cos, sin, position_ids)
 
     if past_key_value is not None:
-        key_states, value_states = past_key_value.update(key_states, value_states,
-                                                         self.layer_idx, None)
+        # [CompressKV]
+        if use_compresskv:
+            enough_kv_room = is_enough_kv_cache_room_4_36(past_key_value, self.layer_idx,
+                                                          q_len)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx,
+                query_states, attention_mask, self.num_key_value_groups,
+                self.config, enough_kv_room, 256)
+        else:
+            key_states, value_states = past_key_value.update(key_states, value_states,
+                                                             self.layer_idx, None)
 
     attn_weights = None
     if query_states.device.type == "cpu":
@@ -460,6 +472,8 @@ def qwen2_attention_forward(
                            is_causal=True).to(hidden_states.dtype)
     elif use_sdp(q_len, kv_seq_len, self.head_dim, query_states):
         import xe_addons
+        if use_compresskv:
+            attention_mask = None
         if isinstance(past_key_value, DynamicFp8Cache):
             attn_output = xe_addons.sdp_fp8(query_states, key_states, value_states,
                                             attention_mask)
@@ -501,3 +515,26 @@ def qwen2_attention_forward(
     if not output_attentions:
         attn_weights = None
     return attn_output, attn_weights, past_key_value
+
+
+def qwen2_mlp_forward(
+    self,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    qtype = getattr(self.gate_proj, "qtype", None)
+    if mlp_fusion_check(x_2d, qtype, self.training) and not self.down_proj.enable_xetla:
+        import xe_linear
+        return self.down_proj(xe_linear.mlp_forward_xpu(
+            x_2d, self.gate_proj.weight.data, self.up_proj.weight.data,
+            x_2d.shape[0], x_2d.shape[1], self.gate_proj.out_len,
+            SILU, qtype
+        ))
+    elif x.device.type == "xpu" and not self.training:
+        import xe_addons
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        xe_addons.mlp_silu_mul_inplaced(gate, up)
+        return self.down_proj(gate)
+    else:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))

@@ -554,7 +554,7 @@ jobs:
           pip install --upgrade pip
           pip install --upgrade wheel
           pip install --upgrade omegaconf pandas
-          pip install --upgrade tiktoken einops transformers_stream_generator
+          pip install --upgrade tiktoken einops transformers_stream_generator matplotlib
 
           cd python\llm
           python setup.py clean --all bdist_wheel --win
@@ -584,7 +584,7 @@ jobs:
           pip install --upgrade pip
           pip install --upgrade wheel
           pip install --upgrade omegaconf pandas
-          pip install --upgrade tiktoken einops transformers_stream_generator
+          pip install --upgrade tiktoken einops transformers_stream_generator matplotlib
 
           pip install --pre --upgrade ipex-llm[xpu] --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/
           pip show ipex-llm | findstr %TEST_VERSION_DATE%
@@ -623,12 +623,17 @@ jobs:
 
           sed -i "s/date.today()/\"$date_for_test_version\"/g" python/llm/dev/benchmark/all-in-one/run.py
 
-      - name: Add extra warmup for chatglm3-6b int4+fp32 for more stable results
+      - name: Add extra warmup for chatglm3-6b int4+fp32 & MiniCPM int4+fp16 int4+fp32 for more stable results
         shell: bash
         run: |
           sed -i '/^\s*result = run_transformer_int4_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)/ i\
-                  if repo_id in ["THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat"]:\
+                  if repo_id in ["THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "openbmb/MiniCPM-1B-sft-bf16", "openbmb/MiniCPM-2B-sft-bf16"]:\
                       run_transformer_int4_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)
+          ' python/llm/dev/benchmark/all-in-one/run.py
+          
+          sed -i '/^\s*result = run_transformer_int4_fp16_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)/ i\
+                  if repo_id in ["openbmb/MiniCPM-1B-sft-bf16", "openbmb/MiniCPM-2B-sft-bf16"]:\
+                      run_transformer_int4_fp16_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)
           ' python/llm/dev/benchmark/all-in-one/run.py
 
       # 32-32 int4+fp16
@@ -654,6 +659,8 @@ jobs:
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\32-32_int4_fp16\log\%LOG_FILE% 2>&1
           if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
 
@@ -676,6 +683,33 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\32-32_int4_fp16_437.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\32-32_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+          
+      - name: Prepare igpu perf test for transformers 4.38 (32-32 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/32-32_int4_fp16_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (32-32 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\32-32_int4_fp16_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\32-32_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 if %ERRORLEVEL% neq -1073740791 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -703,7 +737,7 @@ jobs:
         shell: bash
         run: |
           sed -i 's/32-32/1024-128/g' python/llm/dev/benchmark/all-in-one/run.py
-          sed -i 's/{today}_test2/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/{today}_test3/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
           sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/1024-128_int4_fp16.yaml
 
       - name: Test on igpu (1024-128 int4+fp16)
@@ -721,6 +755,8 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\1024-128_int4_fp16.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\1024-128_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -744,6 +780,33 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\1024-128_int4_fp16_437.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\1024-128_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+          
+      - name: Prepare igpu perf test for transformers 4.38 (1024-128 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/1024-128_int4_fp16_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (1024-128 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\1024-128_int4_fp16_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\1024-128_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -770,7 +833,7 @@ jobs:
         shell: bash
         run: |
           sed -i 's/1024-128/2048-256/g' python/llm/dev/benchmark/all-in-one/run.py
-          sed -i 's/{today}_test2/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/{today}_test3/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
           sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/2048-256_int4_fp16.yaml
 
       - name: Test on igpu (2048-256 int4+fp16)
@@ -788,6 +851,8 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\2048-256_int4_fp16.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\2048-256_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -812,6 +877,33 @@ jobs:
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\2048-256_int4_fp16\log\%LOG_FILE% 2>&1
           if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+          
+      - name: Prepare igpu perf test for transformers 4.38 (2048-256 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/2048-256_int4_fp16_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (2048-256 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\2048-256_int4_fp16_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\2048-256_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
+          if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
 
@@ -832,12 +924,204 @@ jobs:
 
           call conda deactivate
 
+      # 3072-384 int4+fp16
+      - name: Prepare igpu perf test (3072-384 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/2048-256/3072-384/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/{today}_test3/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/3072-384_int4_fp16.yaml
+      
+      - name: Test on igpu (3072-384 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.36.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+          REM for llava
+          set TRANSFORMERS_OFFLINE=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\3072-384_int4_fp16.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\3072-384_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Prepare igpu perf test for transformers 4.37 (3072-384 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test1/{today}_test2/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/3072-384_int4_fp16_437.yaml
+
+      - name: Test on igpu for transformers 4.37 (3072-384 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.37.0
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\3072-384_int4_fp16_437.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\3072-384_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Prepare igpu perf test for transformers 4.38 (3072-384 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/3072-384_int4_fp16_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (3072-384 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\3072-384_int4_fp16_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\3072-384_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Concat csv and generate html (3072-384 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate html-gen
+
+          cd python\llm\dev\benchmark\all-in-one
+          python ..\..\..\test\benchmark\concat_csv.py
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          del /q *test*.csv
+          move *.csv %CSV_SAVE_PATH%\3072-384_int4_fp16\
+          cd ..\..\..\test\benchmark
+          python csv_to_html.py -f %CSV_SAVE_PATH%\3072-384_int4_fp16\
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          move %CSV_SAVE_PATH%\3072-384_int4_fp16\*.html %CSV_SAVE_PATH%
+
+          call conda deactivate
+
+      # 4096-512 int4+fp16
+      - name: Prepare igpu perf test (4096-512 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/3072-384/4096-512/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/{today}_test3/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/4096-512_int4_fp16.yaml
+      
+      - name: Test on igpu (4096-512 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.36.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+          REM for llava
+          set TRANSFORMERS_OFFLINE=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\4096-512_int4_fp16.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\4096-512_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Prepare igpu perf test for transformers 4.37 (4096-512 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test1/{today}_test2/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/4096-512_int4_fp16_437.yaml
+
+      - name: Test on igpu for transformers 4.37 (4096-512 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.37.0
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\4096-512_int4_fp16_437.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\4096-512_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Prepare igpu perf test for transformers 4.38 (4096-512 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/4096-512_int4_fp16_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (4096-512 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\4096-512_int4_fp16_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\4096-512_int4_fp16\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Concat csv and generate html (4096-512 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate html-gen
+
+          cd python\llm\dev\benchmark\all-in-one
+          python ..\..\..\test\benchmark\concat_csv.py
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          del /q *test*.csv
+          move *.csv %CSV_SAVE_PATH%\4096-512_int4_fp16\
+          cd ..\..\..\test\benchmark
+          python csv_to_html.py -f %CSV_SAVE_PATH%\4096-512_int4_fp16\
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          move %CSV_SAVE_PATH%\4096-512_int4_fp16\*.html %CSV_SAVE_PATH%
+
+          call conda deactivate
+
       # load_low_bit 1024-128 int4+fp16 
       - name: Prepare igpu perf test (load_low_bit 1024-128 int4+fp16)
         shell: bash
         run: |
-          sed -i 's/2048-256/1024-128/g' python/llm/dev/benchmark/all-in-one/run.py
-          sed -i 's/{today}_test2/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/4096-512/1024-128/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/{today}_test3/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
           sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/1024-128_int4_fp16_loadlowbit.yaml
 
       - name: Test on igpu (load_low_bit 1024-128 int4+fp16)
@@ -855,6 +1139,8 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\1024-128_int4_fp16_loadlowbit.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\1024-128_int4_fp16_loadlowbit\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -878,6 +1164,33 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\1024-128_int4_fp16_loadlowbit_437.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\1024-128_int4_fp16_loadlowbit\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Prepare igpu perf test for transformers 4.38 (load_low_bit 1024-128 int4+fp16)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/1024-128_int4_fp16_loadlowbit_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (load_low_bit 1024-128 int4+fp16)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\1024-128_int4_fp16_loadlowbit_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\1024-128_int4_fp16_loadlowbit\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -903,7 +1216,7 @@ jobs:
       - name: Prepare igpu perf test (1024-128)
         shell: bash
         run: |
-          sed -i 's/{today}_test2/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i 's/{today}_test3/{today}_test1/g' python/llm/dev/benchmark/all-in-one/run.py
           sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/1024-128.yaml
 
       - name: Test on igpu (1024-128)
@@ -921,6 +1234,8 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\1024-128.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\1024-128\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test1
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
@@ -944,6 +1259,33 @@ jobs:
           move ..\..\..\test\benchmark\igpu-perf\1024-128_437.yaml config.yaml
           set PYTHONIOENCODING=utf-8
           python run.py >> %CSV_SAVE_PATH%\1024-128\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test2
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+
+          call conda deactivate
+
+      - name: Prepare igpu perf test for transformers 4.38 (1024-128)
+        shell: bash
+        run: |
+          sed -i 's/{today}_test2/{today}_test3/g' python/llm/dev/benchmark/all-in-one/run.py
+          sed -i "s/path to your local model hub/$MODEL_HUB_DIR/g" python/llm/test/benchmark/igpu-perf/1024-128_438.yaml
+
+      - name: Test on igpu for transformers 4.38 (1024-128)
+        shell: cmd
+        run: |
+          call conda activate igpu-perf
+          pip install transformers==4.38.2
+
+          set SYCL_CACHE_PERSISTENT=1
+          set BIGDL_LLM_XMX_DISABLED=1
+
+          cd python\llm\dev\benchmark\all-in-one
+          move ..\..\..\test\benchmark\igpu-perf\1024-128_438.yaml config.yaml
+          set PYTHONIOENCODING=utf-8
+          python run.py >> %CSV_SAVE_PATH%\1024-128\log\%LOG_FILE% 2>&1
+          if %ERRORLEVEL% neq 0 (exit /b 1)
+          python ..\..\..\test\benchmark\igpu-perf\check_csv_results.py --yaml-file config.yaml --suffix test3
           if %ERRORLEVEL% neq 0 (exit /b 1)
 
           call conda deactivate
